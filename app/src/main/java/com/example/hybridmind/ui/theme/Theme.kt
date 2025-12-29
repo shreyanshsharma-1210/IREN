@@ -28,11 +28,18 @@ private val LightColorScheme = lightColorScheme(
 )
 
 @Composable
-fun HybridMindTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
+fun IRENTheme(
+    themeMode: com.example.hybridmind.data.ThemeMode = com.example.hybridmind.data.ThemeMode.SYSTEM,
     dynamicColor: Boolean = true,
     content: @Composable () -> Unit
 ) {
+    // Calculate darkTheme based on ThemeMode
+    val darkTheme = when (themeMode) {
+        com.example.hybridmind.data.ThemeMode.LIGHT -> false
+        com.example.hybridmind.data.ThemeMode.DARK -> true
+        com.example.hybridmind.data.ThemeMode.SYSTEM -> isSystemInDarkTheme()
+    }
+    
     val colorScheme = when {
         dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
             val context = LocalContext.current

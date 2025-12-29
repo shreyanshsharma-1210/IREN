@@ -1,9 +1,12 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
     id("com.google.devtools.ksp")
     id("com.google.gms.google-services")
 }
+
+import java.util.Properties
 
 android {
     namespace = "com.example.hybridmind"
@@ -20,6 +23,17 @@ android {
         vectorDrawables {
             useSupportLibrary = true
         }
+        
+        // Read API key from local.properties
+        val localProperties = Properties()
+        val localPropertiesFile = rootProject.file("local.properties")
+        if (localPropertiesFile.exists()) {
+            localPropertiesFile.inputStream().use { localProperties.load(it) }
+        }
+        
+        // Add API key to BuildConfig
+        val geminiApiKey = localProperties.getProperty("GEMINI_API_KEY") ?: ""
+        buildConfigField("String", "GEMINI_API_KEY", "\"$geminiApiKey\"")
     }
 
     buildTypes {
@@ -37,9 +51,7 @@ android {
     }
     buildFeatures {
         compose = true
-    }
-    composeOptions {
-        kotlinCompilerExtensionVersion = "1.5.11"
+        buildConfig = true
     }
     packaging {
         resources {
@@ -62,12 +74,15 @@ dependencies {
     implementation("androidx.navigation:navigation-compose:2.7.7")
     implementation("io.coil-kt:coil-compose:2.5.0")
     
-    // Gemini (Online) - Upgraded for Gemini 2.5 support
     implementation("com.google.ai.client.generativeai:generativeai:0.9.0")
 
-    // MediaPipe (Offline)
-    implementation("com.google.mediapipe:tasks-genai:0.10.11")
-    implementation("com.google.mediapipe:tasks-vision:0.10.14")
+    // LiteRT-LM (Offline LLM - Google AI Edge Gallery's library)
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.0.0-alpha06")
+    
+    // TFLite Support for GPU acceleration
+    implementation("com.google.android.gms:play-services-tflite-java:16.4.0")
+    implementation("com.google.android.gms:play-services-tflite-gpu:16.4.0")
+    implementation("com.google.android.gms:play-services-tflite-support:16.4.0")
 
     // Room (Database)
     val roomVersion = "2.6.1"
@@ -83,6 +98,9 @@ dependencies {
 
     // WorkManager (Background Tasks)
     implementation("androidx.work:work-runtime-ktx:2.9.0")
+    
+    // DataStore (Preferences)
+    implementation("androidx.datastore:datastore-preferences:1.0.0")
     
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")

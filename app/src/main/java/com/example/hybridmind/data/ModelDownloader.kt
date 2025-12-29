@@ -2,242 +2,209 @@ package com.example.hybridmind.data
 
 import android.content.Context
 import android.os.Environment
-import android.os.PowerManager
 import android.util.Log
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.channels.awaitClose
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
+import androidx.work.*
+import com.example.hybridmind.workers.DownloadWorker
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
-import okhttp3.Request
 import java.io.File
-import java.io.RandomAccessFile
-import java.net.HttpURLConnection
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
+import java.util.UUID
 
 data class DownloadProgress(
     val status: DownloadStatus,
     val progress: Int = 0,
     val downloadedBytes: Long = 0,
-    val totalBytes: Long = 0
+    val totalBytes: Long = 0,
+    val errorMessage: String? = null
 )
 
 enum class DownloadStatus {
     IDLE,
     DOWNLOADING,
     COMPLETED,
-    FAILED
+    FAILED,
+    CANCELLED
 }
 
 class ModelDownloader(private val context: Context) {
 
-    private var wakeLock: PowerManager.WakeLock? = null
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(60, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .retryOnConnectionFailure(true)
-        .protocols(listOf(okhttp3.Protocol.HTTP_1_1))
-        .build()
-        
-    private val isCancelled = AtomicBoolean(false)
+    private val workManager = WorkManager.getInstance(context)
+    private val prefs = context.getSharedPreferences("model_prefs", Context.MODE_PRIVATE)
+    
+    /**
+     * Start downloading a model in the background using WorkManager.
+     * Returns the Work ID that can be used to observe progress.
+     */
+    fun startDownload(modelUrl: String, modelName: String, extension: String = "litertlm"): UUID {
+        val inputData = workDataOf(
+            DownloadWorker.KEY_MODEL_URL to modelUrl,
+            DownloadWorker.KEY_MODEL_NAME to modelName,
+            DownloadWorker.KEY_EXTENSION to extension
+        )
 
-    fun downloadModel(modelUrl: String, modelName: String, extension: String = "litertlm"): Flow<DownloadProgress> = kotlinx.coroutines.flow.callbackFlow {
-        trySend(DownloadProgress(DownloadStatus.IDLE))
-        isCancelled.set(false)
+        val constraints = Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .setRequiresStorageNotLow(true)
+            .build()
 
-        val destination = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "$modelName.$extension")
-        val marker = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "$modelName.$extension.complete")
-        
-        // Check if already downloaded
-        if (destination.exists() && marker.exists() && destination.length() > 0) {
-             trySend(DownloadProgress(DownloadStatus.COMPLETED, 100, destination.length(), destination.length()))
-             close()
-             return@callbackFlow
-        }
+        val downloadRequest = OneTimeWorkRequestBuilder<DownloadWorker>()
+            .setInputData(inputData)
+            .setConstraints(constraints)
+            .setBackoffCriteria(
+                BackoffPolicy.EXPONENTIAL,
+                WorkRequest.MIN_BACKOFF_MILLIS,
+                java.util.concurrent.TimeUnit.MILLISECONDS
+            )
+            .build()
 
-        acquireWakeLock()
-        
-        // Launch download in a separate coroutine so we can keep the flow open
-        val job = launch(Dispatchers.IO) {
-            try {
-                // 1. Get Content Length
-                val headRequest = Request.Builder().url(modelUrl).head().build()
-                val response = client.newCall(headRequest).execute()
-                
-                val totalBytes = response.header("Content-Length")?.toLong() ?: -1L
-                val acceptRanges = response.header("Accept-Ranges") == "bytes"
-                response.close()
+        workManager.enqueueUniqueWork(
+            "download_$modelName",
+            ExistingWorkPolicy.KEEP, // Keep existing download if already running
+            downloadRequest
+        )
 
-                if (totalBytes <= 0L) {
-                    // Fallback or error - unknown size
-                     trySend(DownloadProgress(DownloadStatus.FAILED))
-                     close()
-                     return@launch
-                }
-                
-                // Delete existing partial file and marker
-                if (destination.exists()) destination.delete()
-                if (marker.exists()) marker.delete()
-                destination.createNewFile()
-                
-                // Set file size
-                RandomAccessFile(destination, "rw").use { it.setLength(totalBytes) }
-
-                val downloadedBytes = AtomicLong(0)
-                val chorusCount = 1 // Force single thread to prevent corruption issues
-                val chunkSize = totalBytes / chorusCount
-
-                // Monitor Job
-                val monitorJob = launch {
-                    while (isActive && downloadedBytes.get() < totalBytes && !isCancelled.get()) {
-                        val current = downloadedBytes.get()
-                        val progress = ((current * 100) / totalBytes).toInt()
-                        trySend(DownloadProgress(DownloadStatus.DOWNLOADING, progress, current, totalBytes))
-                        delay(200)
-                    }
-                }
-
-                // Download Chunks
-                try {
-                    coroutineScope {
-                        val deferreds = (0 until chorusCount).map { index ->
-                            async(Dispatchers.IO) {
-                                val start = index * chunkSize
-                                val end = if (index == chorusCount - 1) totalBytes - 1 else (start + chunkSize - 1)
-                                downloadChunk(modelUrl, start, end, destination, downloadedBytes)
-                            }
-                        }
-                        deferreds.awaitAll()
-                    }
-                    
-                    // Final success emit
-                    if (!isCancelled.get()) {
-                        monitorJob.cancel() // Stop monitoring
-                        marker.createNewFile() // Mark as complete
-                        trySend(DownloadProgress(DownloadStatus.COMPLETED, 100, totalBytes, totalBytes))
-                    }
-                    
-                } catch (e: Exception) {
-                    Log.e("ModelDownloader", "Download failed", e)
-                    monitorJob.cancel()
-                    trySend(DownloadProgress(DownloadStatus.FAILED))
-                } finally {
-                    close()
-                }
-
-            } catch (e: Exception) {
-                Log.e("ModelDownloader", "Setup failed", e)
-                trySend(DownloadProgress(DownloadStatus.FAILED))
-                close()
-            } finally {
-                releaseWakeLock()
-            }
-        }
-        
-        awaitClose { 
-            // Cleanup if flow cancelled
-            job.cancel()
-            releaseWakeLock()
-        }
+        Log.d("ModelDownloader", "Download started for $modelName with ID: ${downloadRequest.id}")
+        return downloadRequest.id
     }
 
-    private suspend fun downloadChunk(
-        url: String, 
-        start: Long, 
-        end: Long, 
-        destFile: File, 
-        downloadedCounter: AtomicLong
-    ) {
-        if (isCancelled.get()) return
+    /**
+     * Observe download progress for a given Work ID.
+     * Returns a Flow of DownloadProgress that updates as the download progresses.
+     */
+    fun observeDownloadProgress(workId: UUID): Flow<DownloadProgress> = flow {
+        val workInfo = workManager.getWorkInfoById(workId)
+        
+        // Emit initial state based on work info
+        when (workInfo.await()?.state) {
+            WorkInfo.State.ENQUEUED -> emit(DownloadProgress(DownloadStatus.IDLE))
+            WorkInfo.State.RUNNING -> {
+                val progress = workInfo.await()?.progress
+                emit(DownloadProgress(
+                    status = DownloadStatus.DOWNLOADING,
+                    progress = progress?.getInt(DownloadWorker.KEY_PROGRESS, 0) ?: 0,
+                    downloadedBytes = progress?.getLong(DownloadWorker.KEY_DOWNLOADED_BYTES, 0L) ?: 0L,
+                    totalBytes = progress?.getLong(DownloadWorker.KEY_TOTAL_BYTES, 0L) ?: 0L
+                ))
+            }
+            WorkInfo.State.SUCCEEDED -> emit(DownloadProgress(DownloadStatus.COMPLETED, 100))
+            WorkInfo.State.FAILED -> {
+                val errorMsg = workInfo.await()?.outputData?.getString(DownloadWorker.KEY_ERROR_MESSAGE)
+                emit(DownloadProgress(DownloadStatus.FAILED, errorMessage = errorMsg))
+            }
+            WorkInfo.State.CANCELLED -> emit(DownloadProgress(DownloadStatus.CANCELLED))
+            else -> emit(DownloadProgress(DownloadStatus.IDLE))
+        }
 
-        var retries = 3
-        while (retries > 0) {
-            try {
-                withContext(Dispatchers.IO) {
-                    val request = Request.Builder()
-                        .url(url)
-                        .header("Range", "bytes=$start-$end")
-                        .build()
-
-                    client.newCall(request).execute().use { response ->
-                        if (!response.isSuccessful) throw java.io.IOException("Unexpected code $response")
-
-                        val source = response.body?.byteStream() ?: return@use
-                        val raf = RandomAccessFile(destFile, "rw")
-                        raf.seek(start)
-
-                        val buffer = ByteArray(8192)
-                        var bytesRead: Int
-                        
-                        try {
-                            while (source.read(buffer).also { bytesRead = it } != -1) {
-                                 if (isCancelled.get()) break
-                                 raf.write(buffer, 0, bytesRead)
-                                 downloadedCounter.addAndGet(bytesRead.toLong())
-                            }
-                        } finally {
-                            raf.close()
-                            source.close()
-                        }
-                    }
+        // Continue observing for updates
+        workManager.getWorkInfoByIdFlow(workId).collect { info ->
+            // Handle null WorkInfo (can happen when work is removed/completed)
+            if (info == null) return@collect
+            
+            when (info.state) {
+                WorkInfo.State.ENQUEUED -> emit(DownloadProgress(DownloadStatus.IDLE))
+                WorkInfo.State.RUNNING -> {
+                    val progress = info.progress
+                    emit(DownloadProgress(
+                        status = DownloadStatus.DOWNLOADING,
+                        progress = progress.getInt(DownloadWorker.KEY_PROGRESS, 0),
+                        downloadedBytes = progress.getLong(DownloadWorker.KEY_DOWNLOADED_BYTES, 0L),
+                        totalBytes = progress.getLong(DownloadWorker.KEY_TOTAL_BYTES, 0L)
+                    ))
                 }
-                return // Success
-            } catch (e: Exception) {
-                retries--
-                if (retries == 0 || isCancelled.get()) throw e
-                delay(1000) // Wait before retry
-                
-                // If we retry, we need to reset the downloadedCounter for this chunk? 
-                // Ah, atomic counter is global. This is tricky. 
-                // Because we are writing to the SAME file location, restarting the chunk is idempotent for the file content.
-                // BUT the downloadedCounter will be double-counted if we don't handle it.
-                // However, fixing the counter is complex without tracking "chunk progress".
-                // Since this is just for UI progress bar, being slightly off is better than failing.
-                // We'll accept the slight visual gltich on retry for now to prioritize success.
+                WorkInfo.State.SUCCEEDED -> emit(DownloadProgress(DownloadStatus.COMPLETED, 100))
+                WorkInfo.State.FAILED -> {
+                    val errorMsg = info.outputData.getString(DownloadWorker.KEY_ERROR_MESSAGE)
+                    emit(DownloadProgress(DownloadStatus.FAILED, errorMessage = errorMsg))
+                }
+                WorkInfo.State.CANCELLED -> emit(DownloadProgress(DownloadStatus.CANCELLED))
+                else -> {}
             }
         }
     }
 
+    /**
+     * Cancel an ongoing download.
+     */
+    fun cancelDownload(workId: UUID) {
+        workManager.cancelWorkById(workId)
+        Log.d("ModelDownloader", "Download cancelled: $workId")
+    }
+
+    /**
+     * Cancel download by model name.
+     */
+    fun cancelDownloadByName(modelName: String) {
+        workManager.cancelUniqueWork("download_$modelName")
+        Log.d("ModelDownloader", "Download cancelled: $modelName")
+    }
+
+    /**
+     * Get the file path for a downloaded model.
+     */
     fun getModelPath(modelName: String, extension: String = "litertlm"): String {
-        return File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "$modelName.$extension").absolutePath
+        return File(
+            context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS),
+            "$modelName.$extension"
+        ).absolutePath
     }
 
+    /**
+     * Check if a model has been fully downloaded.
+     */
     fun isModelDownloaded(modelName: String, extension: String = "litertlm"): Boolean {
-        val file = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "$modelName.$extension")
-        val marker = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "$modelName.$extension.complete")
+        val file = File(
+            context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS),
+            "$modelName.$extension"
+        )
+        val marker = File(
+            context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS),
+            "$modelName.$extension.complete"
+        )
         val threshold = if (extension == "tflite") 1024 * 1024 * 2 else 1024 * 1024 * 10
         return file.exists() && file.length() > threshold && marker.exists()
     }
 
-    private fun acquireWakeLock() {
-        val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "HybridMind::ModelDownloadWakeLock"
-        )
-        wakeLock?.acquire(60 * 60 * 1000L) // 60 minutes
+    /**
+     * Save the user's selected model preference.
+     */
+    fun saveSelectedModel(modelName: String) {
+        prefs.edit().putString("selected_model", modelName).apply()
+        Log.d("ModelDownloader", "Saved model preference: $modelName")
     }
 
-    private fun releaseWakeLock() {
-        wakeLock?.let {
-            if (it.isHeld) {
-                it.release()
+    /**
+     * Get the user's last selected model.
+     */
+    fun getSelectedModel(): String? {
+        return prefs.getString("selected_model", null)
+    }
+
+    /**
+     * Get the best available model - prefers user's last selection,
+     * falls back to first available model.
+     */
+    fun getAvailableModel(): String? {
+        // First check user's last selection
+        val selectedModel = getSelectedModel()
+        if (selectedModel != null && isModelDownloaded(selectedModel, "litertlm")) {
+            Log.d("ModelDownloader", "Using user's preferred model: $selectedModel")
+            return selectedModel
+        }
+        
+        // Fallback to first available model
+        return when {
+            isModelDownloaded("gemma-2b", "litertlm") -> {
+                Log.d("ModelDownloader", "Using fallback model: gemma-2b")
+                "gemma-2b"
+            }
+            isModelDownloaded("gemma-4b", "litertlm") -> {
+                Log.d("ModelDownloader", "Using fallback model: gemma-4b")
+                "gemma-4b"
+            }
+            else -> {
+                Log.d("ModelDownloader", "No model available")
+                null
             }
         }
-        wakeLock = null
-    }
-
-    fun cancelDownload() {
-        isCancelled.set(true)
-        releaseWakeLock()
     }
 }

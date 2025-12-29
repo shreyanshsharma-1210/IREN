@@ -3,6 +3,7 @@ package com.example.hybridmind.ui.settings
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
@@ -18,7 +19,7 @@ import com.example.hybridmind.data.DownloadProgress
 import com.example.hybridmind.data.DownloadStatus
 import com.example.hybridmind.data.ModelDownloader
 import com.example.hybridmind.ui.download.ModelOptionCard
-import com.example.hybridmind.ui.download.getAvailableRAM
+
 import com.example.hybridmind.ui.download.formatBytes
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
@@ -39,6 +40,7 @@ fun SettingsScreen(
     // Model Selection State
     var selectedModel by remember { mutableStateOf<String?>(null) }
     var downloadProgress by remember { mutableStateOf<DownloadProgress?>(null) }
+    var currentWorkId by remember { mutableStateOf<java.util.UUID?>(null) }
     
     // Delete Dialog State
     var showDeleteDialog by remember { mutableStateOf(false) }
@@ -47,9 +49,9 @@ fun SettingsScreen(
     // Delete Account Dialog State
     var showDeleteAccountDialog by remember { mutableStateOf(false) }
     var isDeletingAccount by remember { mutableStateOf(false) }
+    var isInitializing by remember { mutableStateOf(false) }
 
-    val availableRamGB = getAvailableRAM(context)
-    val canUseAdvanced = availableRamGB >= 8
+
 
     Scaffold(
         topBar = {
@@ -71,11 +73,101 @@ fun SettingsScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(24.dp)
         ) {
+            // Section: Appearance
+            val themePreference = remember { com.example.hybridmind.data.ThemePreference(context) }
+            var currentTheme by remember { mutableStateOf(com.example.hybridmind.data.ThemeMode.SYSTEM) }
+            
+            // Observe theme mode
+            LaunchedEffect(Unit) {
+                themePreference.observeThemeMode().collect { mode ->
+                    currentTheme = mode
+                }
+            }
+            
+            Text(
+                text = "Appearance",
+                style = MaterialTheme.typography.titleLarge,
+                color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.Bold
+            )
+            
+            // Theme selector using segmented buttons
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                // Light theme button
+                OutlinedButton(
+                    onClick = {
+                        scope.launch {
+                            themePreference.saveThemeMode(com.example.hybridmind.data.ThemeMode.LIGHT)
+                            currentTheme = com.example.hybridmind.data.ThemeMode.LIGHT
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                    colors = if (currentTheme == com.example.hybridmind.data.ThemeMode.LIGHT) {
+                        ButtonDefaults.outlinedButtonColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                    } else {
+                        ButtonDefaults.outlinedButtonColors()
+                    }
+                ) {
+                    Text("Light")
+                }
+                
+                // Dark theme button
+                OutlinedButton(
+                    onClick = {
+                        scope.launch {
+                            themePreference.saveThemeMode(com.example.hybridmind.data.ThemeMode.DARK)
+                            currentTheme = com.example.hybridmind.data.ThemeMode.DARK
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                    colors = if (currentTheme == com.example.hybridmind.data.ThemeMode.DARK) {
+                        ButtonDefaults.outlinedButtonColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                    } else {
+                        ButtonDefaults.outlinedButtonColors()
+                    }
+                ) {
+                    Text("Dark")
+                }
+                
+                // System theme button
+                OutlinedButton(
+                    onClick = {
+                        scope.launch {
+                            themePreference.saveThemeMode(com.example.hybridmind.data.ThemeMode.SYSTEM)
+                            currentTheme = com.example.hybridmind.data.ThemeMode.SYSTEM
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                    colors = if (currentTheme == com.example.hybridmind.data.ThemeMode.SYSTEM) {
+                        ButtonDefaults.outlinedButtonColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                    } else {
+                        ButtonDefaults.outlinedButtonColors()
+                    }
+                ) {
+                    Text("System")
+                }
+            }
+
+            HorizontalDivider()
+
             // Section: AI Intelligence
             Text(
                 text = "Model Selection",
                 style = MaterialTheme.typography.titleLarge,
-                color = MaterialTheme.colorScheme.primary
+                color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.Bold
             )
             
             Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -93,7 +185,7 @@ fun SettingsScreen(
                 val isPremiumDownloaded = modelDownloader.isModelDownloaded("gemma-4b", "litertlm")
                 ModelOptionCard(
                     title = "Advanced (Gemma 3n E4B)" + if(isPremiumDownloaded) " - Ready" else "",
-                    description = if (canUseAdvanced) "Multimodal, higher quality. ~4GB" else "Multimodal, higher quality. ~4GB (May be slow on < 8GB RAM)",
+                    description = "Multimodal, higher quality. ~4GB",
                     enabled = downloadProgress == null, // Always enabled
                     selected = selectedModel == "gemma-4b",
                     onClick = { selectedModel = "gemma-4b" }
@@ -137,10 +229,19 @@ fun SettingsScreen(
                                 // If downloaded
                                 if (modelDownloader.isModelDownloaded(model, "litertlm")) {
                                     try {
+                                        isInitializing = true
                                         val modelPath = modelDownloader.getModelPath(model, "litertlm")
+                                        
+                                        // Initialize the new model immediately
                                         chatRepository.initializeOfflineModel(modelPath)
+                                        
+                                        // Save user's model preference  
+                                        modelDownloader.saveSelectedModel(model)
+                                        
+                                        isInitializing = false
                                         onModelSwitched()
                                     } catch (e: Exception) {
+                                        isInitializing = false
                                         // Handle error
                                     }
                                 } else { 
@@ -151,12 +252,17 @@ fun SettingsScreen(
                                         else -> return@launch
                                     }
                                     
-                                    modelDownloader.downloadModel(url, model, "litertlm").collect { progress ->
+                                    val workId = modelDownloader.startDownload(url, model, "litertlm")
+                                    currentWorkId = workId
+                                    
+                                    modelDownloader.observeDownloadProgress(workId).collect { progress ->
                                         downloadProgress = progress
                                         if (progress.status == DownloadStatus.COMPLETED) {
                                             try {
                                                 val modelPath = modelDownloader.getModelPath(model, "litertlm")
+                                                // Initialize and save preference
                                                 chatRepository.initializeOfflineModel(modelPath)
+                                                modelDownloader.saveSelectedModel(model)
                                                 onModelSwitched()
                                                 downloadProgress = null
                                             } catch (e: Exception) {
@@ -168,15 +274,25 @@ fun SettingsScreen(
                             }
                         }
                     },
-                    enabled = selectedModel != null && downloadProgress == null,
+                    enabled = selectedModel != null && !isInitializing && downloadProgress == null,
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    val label = if (selectedModel != null && modelDownloader.isModelDownloaded(selectedModel!!, "litertlm")) {
-                        "Switch to Selected Model"
+                    if (isInitializing) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onPrimary
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Initializing...")
                     } else {
-                        "Download & Switch"
+                        val label = if (selectedModel != null && modelDownloader.isModelDownloaded(selectedModel!!, "litertlm")) {
+                            "Switch to Selected Model"
+                        } else {
+                            "Download & Switch"
+                        }
+                        Text(label)
                     }
-                    Text(label)
                 }
             }
 
@@ -186,7 +302,8 @@ fun SettingsScreen(
             Text(
                 text = "Data Management",
                 style = MaterialTheme.typography.titleLarge,
-                color = MaterialTheme.colorScheme.primary
+                color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.Bold
             )
             
             OutlinedButton(
@@ -207,7 +324,8 @@ fun SettingsScreen(
             Text(
                 text = "Account",
                 style = MaterialTheme.typography.titleLarge,
-                color = MaterialTheme.colorScheme.primary
+                color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.Bold
             )
             
             Button(

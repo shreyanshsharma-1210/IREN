@@ -1,0 +1,39 @@
+{
+  "project_info": {
+    "project_number": "1066136458646",
+    "project_id": "hybridmind-d058d",
+    "storage_bucket": "hybridmind-d058d.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1066136458646:android:89572de52d01b7715e39b7",
+        "android_client_info": {
+          "package_name": "com.example.hybridmind"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "1066136458646-88ma8i0jpctl1filb1pvri0r8f6qdtq0.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAFdC0RHm_VluS3UjNSdVZ6SbHBBpkbgT0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "1066136458646-88ma8i0jpctl1filb1pvri0r8f6qdtq0.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -1,7 +1,5 @@
 package com.example.hybridmind.ui.download
 
-import android.app.ActivityManager
-import android.content.Context
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
@@ -14,22 +12,30 @@ import androidx.compose.ui.unit.dp
 import com.example.hybridmind.data.DownloadProgress
 import com.example.hybridmind.data.DownloadStatus
 import com.example.hybridmind.data.ModelDownloader
+import com.example.hybridmind.core.NetworkMonitor
 import kotlinx.coroutines.launch
+import androidx.work.WorkManager
+import androidx.work.WorkInfo
+import androidx.work.await
+import java.util.UUID
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DownloadScreen(
     modelDownloader: ModelDownloader,
+    networkMonitor: NetworkMonitor,
     onDownloadComplete: (String) -> Unit,
+    onSkip: () -> Unit = {},
     onBack: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var selectedModel by remember { mutableStateOf<String?>(null) }
     var downloadProgress by remember { mutableStateOf<DownloadProgress?>(null) }
-    
-    val availableRamGB = getAvailableRAM(context)
-    val canUseAdvanced = availableRamGB >= 8
+    var currentWorkId by remember { mutableStateOf<UUID?>(null) }
+    var currentModelName by remember { mutableStateOf<String?>(null) }
+    val snackbarHostState = remember { SnackbarHostState() }
+    val isOnline by networkMonitor.isOnline.collectAsState(initial = true)
 
     LaunchedEffect(Unit) {
         // Check if model was previously downloaded
@@ -43,10 +49,57 @@ fun DownloadScreen(
             return@LaunchedEffect
         }
         
+        // Check for active downloads when screen opens
+        scope.launch {
+            val workManager = WorkManager.getInstance(context)
+            
+            // Try to reconnect to gemma-2b download
+            try {
+                val gemma2bInfo = workManager.getWorkInfosForUniqueWork("download_gemma-2b").await()
+                if (gemma2bInfo.isNotEmpty() && gemma2bInfo[0].state.isFinished == false) {
+                    currentModelName = "gemma-2b"
+                    selectedModel = "gemma-2b"
+                    currentWorkId = gemma2bInfo[0].id
+                    // Reconnect to existing download
+                    modelDownloader.observeDownloadProgress(gemma2bInfo[0].id).collect { progress ->
+                        downloadProgress = progress
+                        if (progress.status == DownloadStatus.COMPLETED) {
+                            onDownloadComplete(modelDownloader.getModelPath("gemma-2b", "litertlm"))
+                        }
+                    }
+                    return@launch
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("DownloadScreen", "Error reconnecting to gemma-2b: ${e.message}")
+            }
+            
+            // Try to reconnect to gemma-4b download
+            try {
+                val gemma4bInfo = workManager.getWorkInfosForUniqueWork("download_gemma-4b").await()
+                if (gemma4bInfo.isNotEmpty() && gemma4bInfo[0].state.isFinished == false) {
+                    currentModelName = "gemma-4b"
+                    selectedModel = "gemma-4b"
+                    currentWorkId = gemma4bInfo[0].id
+                    // Reconnect to existing download
+                    modelDownloader.observeDownloadProgress(gemma4bInfo[0].id).collect { progress ->
+                        downloadProgress = progress
+                        if (progress.status == DownloadStatus.COMPLETED) {
+                            onDownloadComplete(modelDownloader.getModelPath("gemma-4b", "litertlm"))
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("DownloadScreen", "Error reconnecting to gemma-4b: ${e.message}")
+            }
+        }
+        
         // No model found - show download screen
     }
 
     Scaffold(
+        snackbarHost = {
+            SnackbarHost(hostState = snackbarHostState)
+        },
         topBar = {
             TopAppBar(
                 title = { Text("Download AI Model") },
@@ -95,18 +148,17 @@ fun DownloadScreen(
 
                 // Standard Model - Multimodal
                 ModelOptionCard(
-                    title = "Standard (Gemma 3n E2B - Multimodal)",
-                    description = "Multimodal AI with image support. ~2GB",
+                    title = "Standard (Gemma 3n E2B)",
+                    description = "Multimodal AI with image support. ~2GB download",
                     enabled = downloadProgress == null,
                     selected = selectedModel == "gemma-2b",
                     onClick = { selectedModel = "gemma-2b" }
                 )
 
                 // Advanced Model
-                // Advanced Model - Gemma 3n E4B
                 ModelOptionCard(
-                    title = "Advanced (Gemma 3n E4B - Multimodal)",
-                    description = if (canUseAdvanced) "Better quality, multimodal. ~4GB" else "Better quality. ~4GB (May be slow on < 8GB RAM)",
+                    title = "Advanced (Gemma 3n E4B)",
+                    description = "Better quality, multimodal. ~4GB download",
                     enabled = downloadProgress == null,
                     selected = selectedModel == "gemma-4b",
                     onClick = { selectedModel = "gemma-4b" }
@@ -124,6 +176,11 @@ fun DownloadScreen(
                                 text = "${downloadProgress!!.progress}% - ${formatBytes(downloadProgress!!.downloadedBytes)} / ${formatBytes(downloadProgress!!.totalBytes)}",
                                 style = MaterialTheme.typography.bodySmall
                             )
+                            Text(
+                                text = "Download continues even if you close the app",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
                         }
                         DownloadStatus.COMPLETED -> {
                             Text(
@@ -133,65 +190,160 @@ fun DownloadScreen(
                         }
                         DownloadStatus.FAILED -> {
                             Text(
-                                text = "Download failed. Please try again.",
-                                color = MaterialTheme.colorScheme.error
+                                text = "❌ Download failed: ${downloadProgress!!.errorMessage ?: "Unknown error"}",
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.bodyMedium
                             )
+                            Text(
+                                text = "Please try again",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        DownloadStatus.CANCELLED -> {
+                            // Reset to allow new selection
+                            LaunchedEffect(Unit) {
+                                downloadProgress = null
+                            }
                         }
                         else -> {}
                     }
                 }
 
-                Button(
-                    onClick = {
-                        selectedModel?.let { model ->
-                            scope.launch {
-                                // Model URLs hosted on Hugging Face
-                                // User's Hugging Face URLs with direct download access
-                                val url = when (model) {
-                                    "gemma-2b" -> "https://huggingface.co/Ph03nix1210/HybridMind-Assets/resolve/main/gemma-3n-E2B-it-int4.litertlm"
-                                    "gemma-4b" -> "https://huggingface.co/Ph03nix1210/HybridMind-Assets/resolve/main/gemma-3n-E4B-it-int4.litertlm"
-                                    else -> return@launch
+                // Download/Retry Button
+                if (downloadProgress?.status == DownloadStatus.FAILED) {
+                    // Show Try Again button when download fails
+                    Button(
+                        onClick = {
+                            // Check network before retry
+                            if (!isOnline) {
+                                scope.launch {
+                                    snackbarHostState.showSnackbar(
+                                        message = "⚠️ No network connection. Please connect to WiFi or mobile data.",
+                                        duration = SnackbarDuration.Short
+                                    )
                                 }
-                                
-                                modelDownloader.downloadModel(url, model, "litertlm").collect { progress ->
-                                    downloadProgress = progress
-                                    if (progress.status == DownloadStatus.COMPLETED) {
-                                        // Main model downloaded - proceed with initialization
-                                        onDownloadComplete(modelDownloader.getModelPath(model, "litertlm"))
-                                        
-                                        // Download Vision Model in background (non-blocking)
-                                        // This is for image classification support
-                                        scope.launch {
-                                            try {
-                                                val visionUrl = "https://storage.googleapis.com/mediapipe-models/image_classifier/efficientnet_lite0/float32/1/efficientnet_lite0.tflite"
-                                                modelDownloader.downloadModel(visionUrl, "efficientnet_lite0", "tflite").collect { visionProgress ->
-                                                    if (visionProgress.status == DownloadStatus.COMPLETED) {
-                                                        android.util.Log.d("DownloadScreen", "Vision model downloaded successfully")
-                                                    } else if (visionProgress.status == DownloadStatus.FAILED) {
-                                                        android.util.Log.w("DownloadScreen", "Vision model download failed - image features may be limited")
+                                return@Button
+                            }
+                            
+                            selectedModel?.let { model ->
+                                currentModelName = model
+                                scope.launch {
+                                    val url = when (model) {
+                                        "gemma-2b" -> "https://huggingface.co/Ph03nix1210/HybridMind-Assets/resolve/main/gemma-3n-E2B-it-int4.litertlm"
+                                        "gemma-4b" -> "https://huggingface.co/Ph03nix1210/HybridMind-Assets/resolve/main/gemma-3n-E4B-it-int4.litertlm"
+                                        else -> return@launch
+                                    }
+                                    
+                                    // Reset progress to null so Download button becomes enabled if retry fails
+                                    downloadProgress = null
+                                    
+                                    // Start new download
+                                    val workId = modelDownloader.startDownload(url, model, "litertlm")
+                                    currentWorkId = workId
+                                    
+                                    // Observe progress
+                                    modelDownloader.observeDownloadProgress(workId).collect { progress ->
+                                        downloadProgress = progress
+                                        if (progress.status == DownloadStatus.COMPLETED) {
+                                            onDownloadComplete(modelDownloader.getModelPath(model, "litertlm"))
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.error
+                        )
+                    ) {
+                        Text("Try Again")
+                    }
+                } else {
+                    // Show Download button when no download is in progress
+                    Button(
+                        onClick = {
+                            selectedModel?.let { model ->
+                                currentModelName = model
+                                scope.launch {
+                                    val url = when (model) {
+                                        "gemma-2b" -> "https://huggingface.co/Ph03nix1210/HybridMind-Assets/resolve/main/gemma-3n-E2B-it-int4.litertlm"
+                                        "gemma-4b" -> "https://huggingface.co/Ph03nix1210/HybridMind-Assets/resolve/main/gemma-3n-E4B-it-int4.litertlm"
+                                        else -> return@launch
+                                    }
+                                    
+                                    val workId = modelDownloader.startDownload(url, model, "litertlm")
+                                    currentWorkId = workId
+                                    
+                                    // Observe progress
+                                    modelDownloader.observeDownloadProgress(workId).collect { progress ->
+                                        downloadProgress = progress
+                                        if (progress.status == DownloadStatus.COMPLETED) {
+                                            // Main model downloaded - proceed with initialization
+                                            onDownloadComplete(modelDownloader.getModelPath(model, "litertlm"))
+                                            
+                                            // Download Vision Model in background (non-blocking)
+                                            scope.launch {
+                                                try {
+                                                    val visionUrl = "https://storage.googleapis.com/mediapipe-models/image_classifier/efficientnet_lite0/float32/1/efficientnet_lite0.tflite"
+                                                    val visionWorkId = modelDownloader.startDownload(visionUrl, "efficientnet_lite0", "tflite")
+                                                    modelDownloader.observeDownloadProgress(visionWorkId).collect { visionProgress ->
+                                                        if (visionProgress.status == DownloadStatus.COMPLETED) {
+                                                            android.util.Log.d("DownloadScreen", "Vision model downloaded successfully")
+                                                        } else if (visionProgress.status == DownloadStatus.FAILED) {
+                                                            android.util.Log.w("DownloadScreen", "Vision model download failed - image features may be limited")
+                                                        }
                                                     }
+                                                } catch (e: Exception) {
+                                                    android.util.Log.e("DownloadScreen", "Vision model download error: ${e.message}")
                                                 }
-                                            } catch (e: Exception) {
-                                                android.util.Log.e("DownloadScreen", "Vision model download error: ${e.message}")
-                                                // Non-critical error - app can still function without vision model
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = selectedModel != null && downloadProgress == null
-                ) {
-                    Text("Download")
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = selectedModel != null && downloadProgress == null
+                    ) {
+                        Text("Download")
+                    }
                 }
 
-                Text(
-                    text = "Device RAM: ${availableRamGB}GB",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+                // Cancel button (only show during download)
+                if (downloadProgress?.status == DownloadStatus.DOWNLOADING) {
+                    OutlinedButton(
+                        onClick = {
+                            currentWorkId?.let { modelDownloader.cancelDownload(it) }
+                            downloadProgress = null
+                            currentWorkId = null
+                            selectedModel = null  // Reset selection to allow fresh start
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Cancel Download")
+                    }
+                }
+                
+                // Skip button (only show when no download is in progress)
+                if (downloadProgress == null || downloadProgress?.status == DownloadStatus.FAILED) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    TextButton(
+                        onClick = onSkip,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = "Skip for now",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Text(
+                        text = "You can download the model later from Settings",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 8.dp)
+                    )
+                }
             }
         }
     }
@@ -238,13 +390,6 @@ fun ModelOptionCard(
             )
         }
     }
-}
-
-fun getAvailableRAM(context: Context): Int {
-    val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-    val memoryInfo = ActivityManager.MemoryInfo()
-    activityManager.getMemoryInfo(memoryInfo)
-    return (memoryInfo.totalMem / (1024 * 1024 * 1024)).toInt()
 }
 
 fun formatBytes(bytes: Long): String {

@@ -40,6 +40,12 @@ class ChatRepository(
     private val firestoreRepository = FirestoreRepository()
     private val syncScope = CoroutineScope(Dispatchers.IO)
 
+    // Helper function to extract first name from full name
+    private fun getFirstName(fullName: String?): String {
+        if (fullName.isNullOrBlank()) return "there"
+        return fullName.trim().split(" ").firstOrNull() ?: "there"
+    }
+
 
     // Initialize LiteRT-LM Engine (call this after model download)
     suspend fun initializeOfflineModel(modelPath: String) {
@@ -169,16 +175,39 @@ class ChatRepository(
         val isOfflineSession = session.is_offline_only
 
         val modelResponse = withContext(Dispatchers.IO) {
-            if (isOnline && !isOfflineSession) { // Only use online if session allows it
-                // Online: Try Gemini first
+            if (isOnline && !isOfflineSession) {
+                // Try Gemini first, with automatic fallback to offline model on failure
                 try {
+                    android.util.Log.d("ChatRepository", "Attempting Gemini (online) generation...")
                     generateWithGemini(sessionId, userMessage, imageData)
                 } catch (e: Exception) {
-                    android.util.Log.e("ChatRepository", "Gemini failed: ${e.message}")
-                    "Error: Online generation failed. ${e.message}"
+                    android.util.Log.e("ChatRepository", "Gemini failed: ${e.message}", e)
+                    android.util.Log.d("ChatRepository", "Attempting automatic fallback to offline model...")
+                    
+                    // Check if offline model is available
+                    if (isOfflineModelReady()) {
+                        try {
+                            android.util.Log.d("ChatRepository", "Using offline model as fallback")
+                            val offlineResponse = generateWithMediaPipe(sessionId, userMessage, imageData)
+                            
+                            // Mark session as offline-only since we used the offline model
+                            val updatedSession = session.copy(is_offline_only = true)
+                            chatDao.updateSession(updatedSession)
+                            android.util.Log.d("ChatRepository", "✓ Fallback successful, session marked as offline-only")
+                            
+                            offlineResponse
+                        } catch (offlineError: Exception) {
+                            android.util.Log.e("ChatRepository", "Offline model fallback also failed: ${offlineError.message}", offlineError)
+                            "Error: Both online and offline models failed. Online error: ${e.message}. Offline error: ${offlineError.message}"
+                        }
+                    } else {
+                        android.util.Log.e("ChatRepository", "Offline model not initialized, cannot fallback")
+                        "Error: Online generation failed and offline model is not available. Please download an offline model from Settings. Error: ${e.message}"
+                    }
                 }
             } else {
-                // Offline: Use MediaPipe
+                // Offline or offline-only session: Use MediaPipe directly
+                android.util.Log.d("ChatRepository", "Using offline model (offline mode or offline-only session)")
                 generateWithMediaPipe(sessionId, userMessage, imageData)
             }
         }
@@ -246,6 +275,123 @@ class ChatRepository(
     ): String {
         saveUserMessage(sessionId, userMessage, imageData, saveImageToMessage)
         return generateResponse(sessionId, userMessage, imageData)
+    }
+    
+    // Streaming version of sendMessage
+    suspend fun sendMessageStream(
+        sessionId: String,
+        userMessage: String,
+        imageData: ByteArray? = null,
+        saveImageToMessage: Boolean = true,
+        onChunk: (String) -> Unit
+    ): String {
+        saveUserMessage(sessionId, userMessage, imageData, saveImageToMessage)
+        return generateResponseStream(sessionId, userMessage, imageData, onChunk)
+    }
+    
+    // Streaming version of generateResponse
+    suspend fun generateResponseStream(
+        sessionId: String,
+        userMessage: String,
+        imageData: ByteArray? = null,
+        onChunk: (String) -> Unit
+    ): String {
+        val isOnline = networkMonitor.isOnline.first()
+        val currentUserId = FirebaseAuth.getInstance().currentUser?.uid ?: return "Error: Not signed in"
+        
+        val session = chatDao.getAllSessions(currentUserId).find { it.id == sessionId } ?: return "Error: Session not found"
+        val isOfflineSession = session.is_offline_only
+
+        val modelResponse = withContext(Dispatchers.IO) {
+            if (isOnline && !isOfflineSession) {
+                // Try Gemini streaming first
+                try {
+                    android.util.Log.d("ChatRepository", "Attempting Gemini (online) streaming generation...")
+                    generateWithGeminiStream(sessionId, userMessage, imageData, onChunk)
+                } catch (e: Exception) {
+                    android.util.Log.e("ChatRepository", "Gemini failed: ${e.message}", e)
+                    android.util.Log.d("ChatRepository", "Attempting automatic fallback to offline model...")
+                    
+                    // Check if offline model is available
+                    if (isOfflineModelReady()) {
+                        try {
+                            android.util.Log.d("ChatRepository", "Using offline model as fallback")
+                            val offlineResponse = generateWithMediaPipeStream(sessionId, userMessage, imageData, onChunk)
+                            
+                            // Mark session as offline-only
+                            val updatedSession = session.copy(is_offline_only = true)
+                            chatDao.updateSession(updatedSession)
+                            android.util.Log.d("ChatRepository", "✓ Fallback successful, session marked as offline-only")
+                            
+                            offlineResponse
+                        } catch (offlineError: Exception) {
+                            android.util.Log.e("ChatRepository", "Offline model fallback also failed: ${offlineError.message}", offlineError)
+                            "Error: Both online and offline models failed. Online error: ${e.message}. Offline error: ${offlineError.message}"
+                        }
+                    } else {
+                        android.util.Log.e("ChatRepository", "Offline model not initialized, cannot fallback")
+                        "Error: Online generation failed and offline model is not available. Please download an offline model from Settings. Error: ${e.message}"
+                    }
+                }
+            } else {
+                // Offline or offline-only session: Use MediaPipe streaming
+                android.util.Log.d("ChatRepository", "Using offline model streaming (offline mode or offline-only session)")
+                generateWithMediaPipeStream(sessionId, userMessage, imageData, onChunk)
+            }
+        }
+
+        // Save model response to Room
+        val modelMsg = ChatMessage(
+            id = UUID.randomUUID().toString(),
+            session_id = sessionId,
+            role = "model",
+            content = modelResponse,
+            timestamp = System.currentTimeMillis()
+        )
+        chatDao.insertMessage(modelMsg)
+
+        // Sync model response to Firestore (if online and NOT offline-only session)
+        if (isOnline && !isOfflineSession) {
+            syncScope.launch {
+                try {
+                    firestoreRepository.syncMessage(sessionId, modelMsg, isOfflineSession)
+                } catch (e: Exception) {
+                    // Silently fail
+                }
+            }
+        }
+
+        // Update session
+        val newTitle = if (session.title == "New Chat" && userMessage.isNotBlank()) {
+            val words = userMessage.trim().split("\\s+".toRegex())
+            if (words.size > 10) {
+                words.take(10).joinToString(" ") + "..."
+            } else {
+                userMessage
+            }
+        } else {
+            session.title
+        }
+
+        val updatedSession = session.copy(
+            title = newTitle,
+            last_updated = System.currentTimeMillis(),
+            is_offline_only = session.is_offline_only || !isOnline
+        )
+        chatDao.updateSession(updatedSession)
+
+        // Sync session to Firestore (if NOT offline-only)
+        if (!updatedSession.is_offline_only) {
+            syncScope.launch {
+                try {
+                    firestoreRepository.syncSession(updatedSession)
+                } catch (e: Exception) {
+                    // Silently fail
+                }
+            }
+        }
+
+        return modelResponse
     }
 
     @Suppress("UNUSED_PARAMETER")
@@ -374,7 +520,7 @@ class ChatRepository(
                             
                             override fun onDone() {
                                 android.util.Log.d("ChatRepository", "✓ Response complete (${fullResponse.length} chars)")
-                                continuation.resume(fullResponse.toString())
+                                continuation.resume(fullResponse.toString().trim())
                             }
                             
                             override fun onError(throwable: Throwable) {
@@ -390,9 +536,159 @@ class ChatRepository(
             }
         }
     }
+    
+    // Streaming version of generateWithGemini
+    @Suppress("UNUSED_PARAMETER")
+    private suspend fun generateWithGeminiStream(
+        sessionId: String,
+        prompt: String,
+        imageData: ByteArray?,
+        onChunk: (String) -> Unit
+    ): String {
+        val userName = FirebaseAuth.getInstance().currentUser?.displayName
+        val firstName = getFirstName(userName)
+        
+        val systemInstruction = com.google.ai.client.generativeai.type.content {
+            text("You are a helpful AI assistant. The user's name is $firstName, " +
+                 "but only use it sparingly when it feels natural - most responses should be direct and to the point.")
+        }
+        
+        val model = GenerativeModel(
+            modelName = "gemini-2.5-flash",
+            apiKey = geminiApiKey,
+            systemInstruction = systemInstruction
+        )
+        
+        val inputContent = com.google.ai.client.generativeai.type.content("user") {
+            if (imageData != null) {
+                val bitmap = android.graphics.BitmapFactory.decodeByteArray(imageData, 0, imageData.size)
+                image(bitmap)
+            }
+            text(prompt)
+        }
+        
+        val fullResponse = StringBuilder()
+        
+        try {
+            // Stream the response
+            model.generateContentStream(inputContent).collect { chunk ->
+                chunk.text?.let { text ->
+                    fullResponse.append(text)
+                    onChunk(fullResponse.toString()) // Update UI with accumulated text
+                }
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // Cancelled by user - return partial response
+            android.util.Log.d("ChatRepository", "Gemini streaming cancelled by user, returning partial response")
+            return fullResponse.toString()
+        }
+        
+        return fullResponse.toString()
+    }
+    
+    // Streaming version of generateWithMediaPipe
+    @Suppress("UNUSED_PARAMETER")
+    private suspend fun generateWithMediaPipeStream(
+        sessionId: String,
+        prompt: String,
+        imageData: ByteArray?,
+        onChunk: (String) -> Unit
+    ): String {
+        val conv = conversation
+            ?: return "Offline model not initialized. Please download the model first."
+
+        // Add concise instruction only for text-only queries
+        // Images need more descriptive responses
+        val enhancedPrompt = if (imageData == null) {
+            "Be concise and direct. $prompt"
+        } else {
+            prompt  // Let image responses be naturally descriptive
+        }
+        
+        return withContext(Dispatchers.IO) {
+            kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
+                try {
+                    android.util.Log.d("ChatRepository", "Starting MediaPipe streaming generation...")
+                    
+                    // Build contents list
+                    val contents = mutableListOf<Content>()
+                    
+                    // Add image first if present
+                    if (imageData != null) {
+                        android.util.Log.d("ChatRepository", "Adding image (${imageData.size} bytes)")
+                        contents.add(Content.ImageBytes(imageData))
+                    }
+                    
+                    // Add text prompt (with concise instruction for text-only)
+                    if (enhancedPrompt.trim().isNotEmpty()) {
+                        contents.add(Content.Text(enhancedPrompt))
+                    }
+                    
+                    val fullResponse = StringBuilder()
+                    var isCancelled = false
+                    
+                    // Set up cancellation handler
+                    continuation.invokeOnCancellation {
+                        android.util.Log.d("ChatRepository", "MediaPipe streaming cancelled by user")
+                        isCancelled = true
+                        // Resume with current partial response
+                        if (continuation.isActive) {
+                            continuation.resume(fullResponse.toString().trim())
+                        }
+                    }
+                    
+                    // Send message with callback for streaming
+                    conv.sendMessageAsync(
+                        LiteRTMessage.of(contents),
+                        object : MessageCallback {
+                            override fun onMessage(message: LiteRTMessage) {
+                                if (isCancelled) {
+                                    android.util.Log.d("ChatRepository", "Ignoring chunk after cancellation")
+                                    return
+                                }
+                                // Append streaming chunks
+                                val chunk = message.toString()
+                                fullResponse.append(chunk)
+                                onChunk(fullResponse.toString()) // Update UI with accumulated text
+                                android.util.Log.d("ChatRepository", "Chunk received: ${chunk.take(50)}...")
+                            }
+                            
+                            override fun onDone() {
+                                if (isCancelled) {
+                                    android.util.Log.d("ChatRepository", "Generation completed after cancellation, ignoring")
+                                    return
+                                }
+                                android.util.Log.d("ChatRepository", "✓ Response complete (${fullResponse.length} chars)")
+                                if (continuation.isActive) {
+                                    continuation.resume(fullResponse.toString().trim())
+                                }
+                            }
+                            
+                            override fun onError(throwable: Throwable) {
+                                if (isCancelled) {
+                                    android.util.Log.d("ChatRepository", "Error after cancellation, ignoring")
+                                    return
+                                }
+                                android.util.Log.e("ChatRepository", "Error: ${throwable.message}", throwable)
+                                if (continuation.isActive) {
+                                    continuation.resumeWithException(throwable)
+                                }
+                            }
+                        }
+                    )
+                } catch (e: Exception) {
+                    android.util.Log.e("ChatRepository", "Error: ${e.message}", e)
+                    if (continuation.isActive) {
+                        continuation.resumeWithException(e)
+                    }
+                }
+            }
+        }
+    }
 
     suspend fun createNewSession(title: String, isOffline: Boolean): String {
-        val currentUserId = FirebaseAuth.getInstance().currentUser?.uid ?: throw IllegalStateException("User not signed in")
+        val currentUserId = FirebaseAuth.getInstance().currentUser?.uid 
+            ?: throw IllegalStateException("Session not created: User authentication not ready. Please wait a moment and try again.")
         val sessionId = UUID.randomUUID().toString()
         val session = ChatSession(
             id = sessionId,
@@ -430,10 +726,36 @@ class ChatRepository(
         }
     }
 
+    suspend fun saveMessage(message: ChatMessage) {
+        withContext(Dispatchers.IO) {
+            chatDao.insertMessage(message)
+        }
+    }
+
     suspend fun deleteAllUserChats() {
         val currentUserId = FirebaseAuth.getInstance().currentUser?.uid ?: return
         withContext(Dispatchers.IO) {
             chatDao.deleteAllSessions(currentUserId)
+        }
+    }
+    
+    suspend fun deleteSession(sessionId: String) {
+        withContext(Dispatchers.IO) {
+            chatDao.deleteSession(sessionId)
+        }
+    }
+    
+    suspend fun deleteEmptySessions() {
+        val currentUserId = FirebaseAuth.getInstance().currentUser?.uid ?: return
+        withContext(Dispatchers.IO) {
+            val sessions = chatDao.getAllSessions(currentUserId)
+            sessions.forEach { session ->
+                val messages = chatDao.getMessagesForSession(session.id)
+                if (messages.isEmpty()) {
+                    chatDao.deleteSession(session.id)
+                    android.util.Log.d("ChatRepository", "Deleted empty session: ${session.title}")
+                }
+            }
         }
     }
 

@@ -44,7 +44,7 @@ fun AuthScreen(
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
                 Text(
-                    text = "HybridMind",
+                    text = "IREN",
                     style = MaterialTheme.typography.headlineLarge
                 )
 
