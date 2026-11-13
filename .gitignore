@@ -111,3 +111,8 @@ Models/
 # Documentation - Ignore all md files except README
 *.md
 !README.md
+!USER_MANUAL.md
+
+# Release APK
+!release/
+!release/*.apk

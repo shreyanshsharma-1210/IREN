@@ -1,0 +1,56 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    background-color: #EAE7DF;
+    color: #171B19;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  ::selection {
+    background: rgba(135, 148, 135, 0.28);
+    color: #171B19;
+  }
+}
+
+@layer utilities {
+  .editorial-card {
+    background-color: #F7F5EF;
+    border: 1px solid #DED9CE;
+    box-shadow: 0 1px 3px rgba(23, 27, 25, 0.03), 0 8px 24px -4px rgba(23, 27, 25, 0.04);
+  }
+
+  .editorial-dark-card {
+    background-color: #1E2320;
+    border: 1px solid rgba(234, 231, 223, 0.1);
+    box-shadow: 0 16px 40px -12px rgba(0, 0, 0, 0.35);
+  }
+
+  .hairline-divider {
+    height: 1px;
+    background: linear-gradient(90deg, transparent 0%, #DED9CE 20%, #DED9CE 80%, transparent 100%);
+  }
+
+  .hairline-dark-divider {
+    height: 1px;
+    background: linear-gradient(90deg, transparent 0%, rgba(234, 231, 223, 0.12) 20%, rgba(234, 231, 223, 0.12) 80%, transparent 100%);
+  }
+}
+
+/* Custom refined scrollbar */
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+::-webkit-scrollbar-track {
+  background: #EAE7DF;
+}
+::-webkit-scrollbar-thumb {
+  background: #C4BFB2;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #879487;
+}
